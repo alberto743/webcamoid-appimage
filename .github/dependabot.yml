@@ -1,0 +1,8 @@
+# Actions are pinned by commit SHA with a trailing "# vX.Y.Z" comment; Dependabot bumps both.
+# The pinned build tools in tools.env are not covered by Dependabot (see update-tools.yml).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

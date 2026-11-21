@@ -1,0 +1,215 @@
+name: Build AppImage
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream stable tag to build (X.Y.Z); empty = newest stable"
+        required: false
+        type: string
+      revision:
+        description: "Packaging revision N: publishes as X.Y.Z-rN instead of overwriting X.Y.Z; empty = none"
+        required: false
+        type: string
+      force:
+        description: "Rebuild and overwrite the assets if the release already exists"
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: appimage-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: webcamoid/webcamoid
+
+jobs:
+  check:
+    name: Check upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    outputs:
+      build: ${{ steps.resolve.outputs.build }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      latest: ${{ steps.resolve.outputs.latest }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # Two failed runs in a row block scheduled runs until a manual run succeeds
+      - name: Gate on previous failures
+        if: github.event_name == 'schedule'
+        run: |
+          prev=$(gh run list --workflow build-appimage.yml --status completed --limit 2 \
+                   --json conclusion --jq '[.[].conclusion] | join(",")')
+          if [ "$prev" = "failure,failure" ]; then
+            open=$(gh issue list --state open --search 'in:title "AppImage builds blocked"' \
+                     --json number --jq length)
+            if [ "$open" = "0" ]; then
+              gh issue create --title "AppImage builds blocked after 2 consecutive failures" \
+                --body "Fix the cause, then run the workflow manually. Any later run that does not end in two failures reopens the gate."
+            fi
+            echo "::error::Gate closed: the last two runs failed"
+            exit 1
+          fi
+
+      - name: Resolve tag
+        id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          # Upstream tags carry no "v" prefix. Stable only: the strict X.Y.Z regex excludes anything else.
+          newest=$(gh api --paginate "repos/$UPSTREAM/tags?per_page=100" --jq '.[].name' \
+                   | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          tag="${INPUT_TAG:-$newest}"
+          [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::'$tag' is not a stable X.Y.Z tag"; exit 1; }
+          gh api "repos/$UPSTREAM/git/ref/tags/$tag" --silent \
+            || { echo "::error::tag $tag does not exist upstream"; exit 1; }
+
+          [[ -z "$REVISION" || "$REVISION" =~ ^[1-9][0-9]*$ ]] || { echo "::error::revision must be a positive integer"; exit 1; }
+          release_tag="$tag${REVISION:+-r$REVISION}"
+
+          build=true
+          if gh release view "$release_tag" >/dev/null 2>&1 && [ "$FORCE" != "true" ]; then
+            build=false
+          fi
+          latest=false
+          [ "$tag" = "$newest" ] && latest=true
+          {
+            echo "build=$build"
+            echo "tag=$tag"
+            echo "release_tag=$release_tag"
+            echo "latest=$latest"
+          } >> "$GITHUB_OUTPUT"
+          echo "tag=$tag build=$build latest=$latest" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build x86_64
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # Same base as upstream's Ubuntu CI; it also fixes the glibc floor of the AppImage (2.39)
+    container: docker.io/library/ubuntu:24.04
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      ARCH: x86_64
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: scripts/install-deps.sh "$RUNNER_TEMP/tools"
+
+      - name: Build Webcamoid ${{ needs.check.outputs.tag }}
+        run: scripts/build-webcamoid.sh "$TAG" "$RUNNER_TEMP/work"
+
+      - name: Build AppImage
+        run: |
+          export PATH="$RUNNER_TEMP/tools/bin:$PATH"
+          scripts/package-appimage.sh --work "$RUNNER_TEMP/work" --tag "$TAG" --arch "$ARCH" --out dist
+
+      - name: Smoke test
+        run: |
+          cd dist
+          appimage=$(ls Webcamoid-*-"$ARCH".AppImage)
+          chmod +x "$appimage"
+          APPIMAGE_EXTRACT_AND_RUN=1 "./$appimage" --appimage-extract >/dev/null
+          test -x squashfs-root/AppRun
+          grep -q '^Name=Webcamoid' squashfs-root/*.desktop
+          # No camera needed: the app must start under a virtual display and report its version
+          APPIMAGE_EXTRACT_AND_RUN=1 timeout 120 xvfb-run --auto-servernum "./$appimage" --version \
+            | tee "$RUNNER_TEMP/version.log"
+          grep -qx "Webcamoid ${TAG}" "$RUNNER_TEMP/version.log"
+          rm -rf squashfs-root
+
+      - name: Add checksums
+        run: |
+          cd dist
+          for f in *.AppImage *.licenses.tar.gz *.source.tar.gz; do
+            [ -e "$f" ] && sha256sum "$f" > "$f.sha256"
+          done
+          ls -l
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: |
+            dist/*.AppImage
+            dist/*.licenses.tar.gz
+            dist/*.source.tar.gz
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: appimage-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.check.outputs.tag }}
+      LATEST: ${{ needs.check.outputs.latest }}
+      RELEASE_TAG: ${{ needs.check.outputs.release_tag }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: appimage-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        run: |
+          cat > notes.md <<EOF
+          **Unofficial** AppImage build of [Webcamoid ${TAG}](https://github.com/${UPSTREAM}/releases/tag/${TAG}),
+          compiled from the unmodified upstream source tag (public components only; the private ExtraPlugins
+          submodule is not included). Not affiliated with or endorsed by the Webcamoid project.
+
+          Webcamoid is licensed under the GNU GPL v3 or later. The complete corresponding source is the
+          \`*.source.tar.gz\` asset (the upstream \`${TAG}\` tag, also at https://github.com/${UPSTREAM}/tree/${TAG})
+          together with the build scripts in this repository at commit ${GITHUB_SHA}. The bundled
+          Qt, FFmpeg and other libraries come from Ubuntu 24.04 and keep their own licenses: see the
+          \`*.licenses.tar.gz\` asset and \`THIRD-PARTY-NOTICES.md\`. See the README for verification.
+          EOF
+          (cd dist && sha256sum -c -- *.sha256)
+          title="Webcamoid ${TAG} AppImage (unofficial)${RELEASE_TAG#"$TAG"}"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+            gh release edit "$RELEASE_TAG" --title "$title" --notes-file notes.md --latest="$LATEST"
+          else
+            # Draft first, publish only after every asset is uploaded, so a failed upload never
+            # leaves a half-filled public release that the next scheduled run would skip
+            gh release create "$RELEASE_TAG" dist/* --draft --title "$title" \
+              --notes-file notes.md --target "$GITHUB_SHA"
+            gh release edit "$RELEASE_TAG" --draft=false --latest="$LATEST"
+          fi
